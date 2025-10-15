@@ -18,20 +18,39 @@ export function ruToEnByLayout(s: string): string {
 }
 
 // Normalize various placeholders to real GS and clean input
-export function normalizeRawInput(input: string): string {
-  let s = input.trim();
-  s = s.replace(/[\r\n\t]+/g, '');
-  s = ruToEnByLayout(s);
-  s = s
-    .replace(/<GS>/gi, GS)
-    .replace(/\[GS\]/gi, GS)
-    .replace(/\^\]/g, GS)
-    .replace(/↔/g, GS)
-    .replace(/[\u001D]/g, GS)
-    .replace(/\\x1d/gi, GS);   // literal "\\x1d"
-  s = s.replace(/<FNC1>/gi, '').replace(/\\F/gi, '');
-  return s;
-}
+export function normalizeRawInput(input: string, opts: NormalizeOpts = {}): string {
+    let s = (input ?? '').trim();
+  
+    // убираем управляющие пробелы, переносы — часто мешают
+    s = s.replace(/[\r\n\t]+/g, '');
+  
+    // ⚠️ опциональная коррекция раскладки (лучше держать выключенной)
+    if (opts.ruToEn && typeof opts.ruToEnByLayout === 'function') {
+      s = opts.ruToEnByLayout(s);
+    }
+  
+    // срезаем вариационные селекторы (например, ↔️ = \u2194 + \uFE0F)
+    s = s.replace(/[\uFE0E\uFE0F]/g, '');
+  
+    // приводим заменители к GS
+    s = s
+      // явные плейсхолдеры
+      .replace(/<GS>|\[GS\]|\^\]/gi, GS)
+      // символ ↔ (и уже без VS)
+      .replace(/\u2194/g, GS)
+      // реальный GS в тексте
+      .replace(/\u001D/g, GS)
+      // литерал "\x1D"
+      .replace(/\\x1d/gi, GS);
+  
+    // иногда кидают плейсхолдер лидера — просто убираем
+    s = s.replace(/<FNC1>/gi, '').replace(/\\F/gi, '');
+  
+    // схлопываем повторы GS
+    s = s.replace(new RegExp(GS + '+', 'g'), GS);
+  
+    return s;
+  }
 
 export type Gs1TailAI = '91'|'92'|'93';
 export type Gs1Tail = { ai: Gs1TailAI; value: string; hadLeadingGs: boolean };
