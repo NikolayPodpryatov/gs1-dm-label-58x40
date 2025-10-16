@@ -9,7 +9,6 @@
         "preview": "vite preview"
     },
     "dependencies": {
-        "bwip-js": "^4.7.0",
         "pdf-lib": "^1.17.1",
         "react": "^18.3.1",
         "react-dom": "^18.3.1"
@@ -17,6 +16,8 @@
     "devDependencies": {
         "@types/react": "^18.3.3",
         "@types/react-dom": "^18.3.0",
+        "@vercel/node": "^5.4.0",
+        "bwip-js": "^4.7.0",
         "typescript": "^5.6.2",
         "vite": "^5.4.8"
     }
