@@ -1,10 +1,9 @@
 // ================================
 // src/pdf.ts
-// Build a 58x40 mm label PDF with GS1 DM (BWIPP) + centered matrix + wrapped ASCII-safe caption
+// Build a 58x40 mm label PDF with GS1 DM (server-side generation of DM PNG) + centered matrix + wrapped ASCII-safe caption
 // ================================
 
 import { PDFDocument, rgb, StandardFonts } from 'pdf-lib'
-import bwipjs from 'bwip-js'
 import { GS } from './dm'
 
 const MM_TO_PT = 2.83465
@@ -14,70 +13,91 @@ export type LabelOptions = {
   widthMm?: number   // default 58
   heightMm?: number  // default 40
   marginMm?: number  // default 3
-  dmBoxMm?: number   // default auto = min(width,height)-2*margin-6 (мы берем -8, оставляя место для подписи)
-  caption?: string   // человекочитаемая подпись (мы ещё её санитайзим)
+  dmBoxMm?: number   // default auto
+  caption?: string
   ai: string         // REQUIRED: скобочная AI-строка '(01)...(21)...(9x)...' для рендера
 }
 
 // ---- helpers ----
 
-// Рендерим GS1 DM в offscreen-canvas из AI-строки
-async function pngFromAI(aiParenthesized: string, scale = 6): Promise<Uint8Array> {
-  const canvas = document.createElement('canvas')
-  const text = aiParenthesized.replace(/\s+/g, '')
-  await new Promise<void>((resolve, reject) => {
-    try {
-      ;(bwipjs as any).toCanvas(canvas, {
-        bcid: 'gs1datamatrix',
-        text,
-        parse: true,          // BWIPP: распарсит AIs, поставит FNC1-лидер и FNC1/GS-разделители по правилам
-        scale,
-        includetext: false,
-        paddingwidth: 0,
-        paddingheight: 0,
-      })
-      resolve()
-    } catch (e) { reject(e) }
-  })
-  const dataUrl = canvas.toDataURL('image/png')
-  const base64 = dataUrl.split(',')[1] ?? ''
-  const bin = atob(base64)
-  const bytes = new Uint8Array(bin.length)
-  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
-  return bytes
+/** Преобразует JS-строку (которая может содержать GS U+001D) в base64,
+ *  сохраняя байт-значения 0..255 (latin1-style).
+ *  Работает корректно для строк, которые у нас генерируются (ASCII + GS).
+ */
+function stringToBase64Latin1(s: string): string {
+  let bin = ''
+  for (let i = 0; i < s.length; i++) {
+    const code = s.charCodeAt(i) & 0xff
+    bin += String.fromCharCode(code)
+  }
+  // btoa доступен в браузере
+  return btoa(bin)
+}
+
+// Рендерим GS1 DM на сервере и получаем PNG как Uint8Array
+// Параметры:
+//  - aiParenthesized: скобочная AI-строка (например "(01)...")
+//  - rawWithGS: опциональная строка, где реальные разделители групп — символ 0x1D (GS)
+// Если rawWithGS указан -> используем режим fnc1-caret (rawBase64) на сервере.
+// Если нет -> fallback на ai + gs1datamatrix.
+async function pngFromAI(aiParenthesized: string, rawWithGS?: string, scale = 6): Promise<Uint8Array> {
+  if (rawWithGS && rawWithGS.length > 0) {
+    const rawBase64 = stringToBase64Latin1(rawWithGS.replace(/\s+/g, ''))
+    const resp = await fetch('/api/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: 'fnc1-caret', rawBase64, scale }),
+    })
+    if (!resp.ok) {
+      const txt = await resp.text().catch(() => '')
+      throw new Error('Server-side generation failed: ' + (txt || resp.statusText))
+    }
+    const arrBuf = await resp.arrayBuffer()
+    return new Uint8Array(arrBuf)
+  } else {
+    // fallback: старый путь — parenthesized AI -> gs1datamatrix
+    const ai = (aiParenthesized || '').replace(/\s+/g, '')
+    const resp = await fetch('/api/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ai, scale }),
+    })
+    if (!resp.ok) {
+      const txt = await resp.text().catch(() => '')
+      throw new Error('Server-side generation failed: ' + (txt || resp.statusText))
+    }
+    const arrBuf = await resp.arrayBuffer()
+    return new Uint8Array(arrBuf)
+  }
 }
 
 // Делает подпись ASCII-безопасной и заменяет GS на <GS>
 function makeSafeCaption(rawWithGS: string, custom?: string): string {
-  const src = (custom ?? rawWithGS).replaceAll(GS, '<GS>')
-  return src.replace(/[^\x20-\x7E]/g, '') // только печатные ASCII
+  if (custom) return custom
+  const replaced = rawWithGS.replaceAll(GS, '<GS>')
+  return replaced.replace(/[^\x20-\x7E\u0400-\u04FF]/g, '')
 }
 
 // Простой перенос по словам с хард-катом очень длинных токенов
-function wrapTextLines(text: string, font: any, fontSize: number, maxWidth: number): string[] {
+function wrapTextLines(text: string, maxCharsPerLine: number): string[] {
+  const words = text.split(/\s+/)
   const lines: string[] = []
-  const words = text.split(/\s+/).filter(Boolean)
-  let line = ''
+  let cur = ''
   for (const w of words) {
-    const test = line ? line + ' ' + w : w
-    if (font.widthOfTextAtSize(test, fontSize) <= maxWidth) {
-      line = test
+    if ((cur ? cur.length + 1 + w.length : w.length) <= maxCharsPerLine) {
+      cur = cur ? cur + ' ' + w : w
     } else {
-      if (line) lines.push(line)
-      if (font.widthOfTextAtSize(w, fontSize) <= maxWidth) {
-        line = w
-      } else {
-        // режем длинный токен
-        let buf = ''
-        for (const ch of w) {
-          const t2 = buf + ch
-          if (font.widthOfTextAtSize(t2, fontSize) > maxWidth) { lines.push(buf); buf = ch } else buf = t2
+      if (cur) lines.push(cur)
+      if (w.length <= maxCharsPerLine) cur = w
+      else {
+        for (let i = 0; i < w.length; i += maxCharsPerLine) {
+          lines.push(w.slice(i, i + maxCharsPerLine))
         }
-        line = buf
+        cur = ''
       }
     }
   }
-  if (line) lines.push(line)
+  if (cur) lines.push(cur)
   return lines
 }
 
@@ -95,40 +115,48 @@ export async function buildLabelPdf(rawWithGS: string, opts: LabelOptions): Prom
   const pdf = await PDFDocument.create()
   const page = pdf.addPage([width, height])
 
-  // Чуть меньше бокса под DM, чтобы оставить место для подписи (увеличиваем последнее значение для уменьшения матрицы)
+  // Чуть меньше бокса под DM, чтобы оставить место для подписи
   const dmSide = mm(
     opts.dmBoxMm ??
-    Math.min((opts.widthMm ?? 58), (opts.heightMm ?? 40)) - 2 * (opts.marginMm ?? 3) - 12
+      Math.min((opts.widthMm ?? 58), (opts.heightMm ?? 40)) - 2 * (opts.marginMm ?? 3) - 12
   )
 
-  // 1) PNG DM (BWIPP + AI-строка)
-  const png = await pngFromAI(opts.ai, 6)
-  const pngEmbed = await pdf.embedPng(png)
+  // Получаем PNG DM с сервера — ВАЖНО: передаём rawWithGS как второй аргумент
+  const pngBytes = await pngFromAI(opts.ai, rawWithGS, 6)
 
-  // 2) Подпись: safe + перенос по словам
-  const captionSafe = makeSafeCaption(rawWithGS, opts.caption)
+  // Вставляем PNG в pdf-lib
+  const pngImage = await pdf.embedPng(pngBytes)
+
+  const imgWidth = dmSide
+  const imgHeight = dmSide
+
+  // Центрируем DM по горизонтали; по вертикали — располагаем над подписью (как раньше)
+  const dmX = (width - imgWidth) / 2
+  const dmY = height - margin - imgHeight
+
+  page.drawImage(pngImage, {
+    x: dmX,
+    y: dmY,
+    width: imgWidth,
+    height: imgHeight,
+  })
+
+  // Подпись (caption) под матрицей — ASCII-safe и центрированная
+  const caption = makeSafeCaption(rawWithGS, opts.caption)
   const font = await pdf.embedFont(StandardFonts.Helvetica)
-  const fontSize = 5                  // компактный текст
-  const lineGap = mm(0.5)             // межстрочный интервал
-  const maxTextWidth = width - 2 * margin
-  const lines = wrapTextLines(captionSafe, font, fontSize, maxTextWidth)
-  const captionHeight = lines.length * fontSize + Math.max(0, lines.length - 1) * lineGap + mm(2) // +2мм отступ под DM
+  const fontSize = 6
+  const lineGap = 2
 
-  // 3) Центрируем DM по горизонтали; по вертикали — над подписью
-  const dmW = dmSide, dmH = dmSide
-  const dmX = (width - dmW) / 2
-  const dmY = Math.max(margin + captionHeight, (height - dmH - captionHeight) / 2 + captionHeight)
+  const approxCharsPerLine = Math.floor((width - margin * 2) / (fontSize * 0.5))
+  const lines = wrapTextLines(caption, Math.max(20, approxCharsPerLine))
 
-  page.drawImage(pngEmbed, { x: dmX, y: dmY, width: dmW, height: dmH })
-
-  // 4) Рисуем подпись по центру, строками, под матрицей
-  let y = dmY - mm(2) - fontSize
+  let textY = dmY - mm(2) - fontSize
   for (const ln of lines) {
-    if (y < mm(2)) break // нижнее поле
-    const tw = font.widthOfTextAtSize(ln, fontSize)
-    const x = (width - tw) / 2
-    page.drawText(ln, { x, y, size: fontSize, font, color: rgb(0, 0, 0) })
-    y -= (fontSize + lineGap)
+    if (textY < mm(1)) break
+    const textWidth = font.widthOfTextAtSize(ln, fontSize)
+    const tx = (width - textWidth) / 2
+    page.drawText(ln, { x: tx, y: textY, size: fontSize, font, color: rgb(0, 0, 0) })
+    textY -= fontSize + lineGap
   }
 
   const bytes = await pdf.save()

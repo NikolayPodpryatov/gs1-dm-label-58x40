@@ -102,7 +102,17 @@ export function parseGs1(inputNormalized: string): Gs1Payload {
       tails.push({ ai, value:v, hadLeadingGs:had }); i+=4;
     } else {
       let v=''; 
-      while(i<s.length && s[i]!==GS){ const nxt=isAI(s,i); if(nxt) break; v+=s[i++]; }
+      // УТВЕРЖДЕНИЕ:
+      // - Если AI=92 был предшествующим GS (had===true) — читать до явного GS-терминатора.
+      //   Это предотвращает ложное распознавание '91'/'92'/'93' внутри base64-поля.
+      // - Если AI=92 идёт вплотную к предыдущему полю (had===false), то допускаем, что следующий AI
+      //   может следовать сразу за значением, поэтому прерываем чтение при обнаружении isAI(s,i).
+      if (had) {
+        while(i<s.length && s[i]!==GS){ v+=s[i++]; }
+      } else {
+        while(i<s.length && s[i]!==GS){ const nxt=isAI(s,i); if(nxt) break; v+=s[i++]; }
+      }
+
       if(!isValid92(v)) throw new Error('E92_LEN');
       tails.push({ ai:'92', value:v, hadLeadingGs:had });
     }
